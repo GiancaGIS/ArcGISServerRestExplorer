@@ -1,0 +1,15 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+arcgis_rest_explorer.log
+
+# Local application data. Connections may reference private services.
+connections.json
+collections.json
+history.json
+setting.json
+geometry_history.json
+/.idea
