@@ -23,6 +23,39 @@ def test_map_html_imports_external_preview_script():
     assert "function escapeHtml" not in html
 
 
+def test_map_html_serializes_basemap_zoom_limits():
+    html = build_leaflet_map_html(
+        [],
+        {
+            "url": "https://example.com/{z}/{x}/{y}.png",
+            "attribution": "Tiles",
+            "maxNativeZoom": 13,
+        },
+        {},
+    )
+
+    assert '"basemapMaxZoom": 19' in html
+    assert '"basemapMaxNativeZoom": 13' in html
+
+
+def test_map_html_serializes_google_basemap_config():
+    html = build_leaflet_map_html(
+        [],
+        {
+            "provider": "google",
+            "googleMapType": "satellite",
+            "googleApiKey": "test-key",
+            "attribution": "Map data &copy; Google",
+            "maxZoom": 22,
+        },
+        {},
+    )
+
+    assert '"basemapProvider": "google"' in html
+    assert '"googleMapType": "satellite"' in html
+    assert '"googleApiKey": "test-key"' in html
+
+
 def test_map_preview_js_escapes_popup_values():
     js = read_map_preview_js()
 
@@ -44,3 +77,11 @@ def test_map_preview_js_exposes_area_drawing_hook():
         {},
     )
     assert "finishPolygonDrawing" in js
+
+
+def test_map_preview_js_supports_google_map_tiles_api():
+    js = read_map_preview_js()
+
+    assert "addGoogleBasemapLayer" in js
+    assert "https://tile.googleapis.com/v1/createSession" in js
+    assert "https://tile.googleapis.com/v1/2dtiles/{z}/{x}/{y}" in js

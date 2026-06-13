@@ -12,7 +12,7 @@ def script_json(value: Any) -> str:
 
 def build_leaflet_map_html(
     geojson_features: list[dict[str, Any]],
-    basemap: dict[str, str],
+    basemap: dict[str, Any],
     renderer_style: dict[str, Any],
     ui_theme: str = "Dark",
 ) -> str:
@@ -21,8 +21,13 @@ def build_leaflet_map_html(
         {
             "data": feature_collection,
             "rendererStyle": renderer_style,
-            "basemapUrl": basemap["url"],
+            "basemapProvider": basemap.get("provider", "xyz"),
+            "basemapUrl": basemap.get("url", ""),
             "attribution": basemap["attribution"],
+            "basemapMaxZoom": basemap.get("maxZoom", 19),
+            "basemapMaxNativeZoom": basemap.get("maxNativeZoom"),
+            "googleMapType": basemap.get("googleMapType"),
+            "googleApiKey": basemap.get("googleApiKey", ""),
         }
     )
     script_url = script_json(MAP_PREVIEW_JS_URL)
@@ -65,6 +70,11 @@ html, body, #map {{ height: 100%; margin: 0; background: {page_bg}; }}
     box-shadow: 0 8px 20px rgba(15, 23, 42, 0.25);
 }}
 .draw-controls button.secondary {{ background: #334155; color: #f8fafc; }}
+.basemap-warning {{
+    position: absolute; z-index: 1000; right: 12px; top: 12px; max-width: 320px;
+    background: rgba(127, 29, 29, 0.92); color: #fef2f2; padding: 9px 12px;
+    border-radius: 8px; font: 13px sans-serif; box-shadow: 0 8px 20px rgba(15, 23, 42, 0.25);
+}}
 </style>
 </head>
 <body>

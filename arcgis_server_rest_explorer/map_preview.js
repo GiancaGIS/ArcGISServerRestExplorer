@@ -8,10 +8,65 @@ const data = mapConfig.data || { type: 'FeatureCollection', features: [] };
 const rendererStyle = mapConfig.rendererStyle || {};
 const map = L.map('map').setView([42.5, 12.5], 5);
 
-L.tileLayer(mapConfig.basemapUrl, {
-    maxZoom: 19,
-    attribution: mapConfig.attribution || ''
-}).addTo(map);
+function tileLayerOptions() {
+    const options = {
+        maxZoom: mapConfig.basemapMaxZoom || 19,
+        attribution: mapConfig.attribution || ''
+    };
+    if (mapConfig.basemapMaxNativeZoom) {
+        options.maxNativeZoom = mapConfig.basemapMaxNativeZoom;
+    }
+    return options;
+}
+
+function showBasemapError(message) {
+    const warning = document.createElement('div');
+    warning.className = 'basemap-warning';
+    warning.textContent = message;
+    document.body.appendChild(warning);
+}
+
+async function addGoogleBasemapLayer() {
+    const apiKey = mapConfig.googleApiKey || '';
+    if (!apiKey) {
+        showBasemapError('Google basemap unavailable: add a Google Maps API key in Program Settings.');
+        return;
+    }
+
+    try {
+        const response = await fetch(`https://tile.googleapis.com/v1/createSession?key=${encodeURIComponent(apiKey)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                mapType: mapConfig.googleMapType || 'roadmap',
+                language: 'en-US',
+                region: 'US'
+            })
+        });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        const session = await response.json();
+        if (!session.session) {
+            throw new Error('Missing session token');
+        }
+        const url = `https://tile.googleapis.com/v1/2dtiles/{z}/{x}/{y}?session=${encodeURIComponent(session.session)}&key=${encodeURIComponent(apiKey)}`;
+        L.tileLayer(url, tileLayerOptions()).addTo(map);
+    } catch (error) {
+        console.error(error);
+        showBasemapError(`Google basemap unavailable: ${error.message}`);
+    }
+}
+
+function addBasemapLayer() {
+    if (mapConfig.basemapProvider === 'google') {
+        addGoogleBasemapLayer();
+        return;
+    }
+    L.tileLayer(mapConfig.basemapUrl, tileLayerOptions()).addTo(map);
+}
+
+addBasemapLayer();
 
 let selectedLayer = null;
 const layersByIndex = {};

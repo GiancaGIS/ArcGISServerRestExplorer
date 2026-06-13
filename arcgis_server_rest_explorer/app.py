@@ -98,6 +98,70 @@ GEOMETRY_HISTORY_FILE = APP_DIR / "geometry_history.json"
 LOG_FILE = APP_DIR / "arcgis_rest_explorer.log"
 MAP_HTML_FILE = APP_DIR / "map_preview.html"
 MAP_SETHTML_MAX_CHARS = 1_500_000
+BASEMAPS: dict[str, dict[str, Any]] = {
+    "OpenStreetMap": {
+        "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "attribution": "&copy; OpenStreetMap contributors",
+    },
+    "ESRI World Imagery": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "attribution": "Tiles &copy; Esri",
+    },
+    "ESRI Streets": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+        "attribution": "Tiles &copy; Esri",
+    },
+    "ESRI Topographic": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+        "attribution": "Tiles &copy; Esri",
+    },
+    "ESRI Terrain": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{z}/{y}/{x}",
+        "attribution": "Tiles &copy; Esri",
+        "maxNativeZoom": 13,
+    },
+    "ESRI Oceans": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}",
+        "attribution": "Tiles &copy; Esri",
+        "maxNativeZoom": 10,
+    },
+    "ESRI National Geographic": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/NatGeo_World_Map/MapServer/tile/{z}/{y}/{x}",
+        "attribution": "Tiles &copy; Esri",
+        "maxNativeZoom": 16,
+    },
+    "ESRI Shaded Relief": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Shaded_Relief/MapServer/tile/{z}/{y}/{x}",
+        "attribution": "Tiles &copy; Esri",
+        "maxNativeZoom": 13,
+    },
+    "ESRI Dark Gray": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+        "attribution": "Tiles &copy; Esri",
+    },
+    "ESRI Light Gray": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+        "attribution": "Tiles &copy; Esri",
+    },
+    "Google Roadmap": {
+        "provider": "google",
+        "googleMapType": "roadmap",
+        "attribution": "Map data &copy; Google",
+        "maxZoom": 22,
+    },
+    "Google Satellite": {
+        "provider": "google",
+        "googleMapType": "satellite",
+        "attribution": "Map data &copy; Google",
+        "maxZoom": 22,
+    },
+    "Google Terrain": {
+        "provider": "google",
+        "googleMapType": "terrain",
+        "attribution": "Map data &copy; Google",
+        "maxZoom": 22,
+    },
+}
 
 
 def migrate_legacy_data_files() -> None:
@@ -380,6 +444,7 @@ class ArcGISRestExplorer(QMainWindow):
         self.current_theme = "Dark"
         self.map_style_preset = "ArcGIS renderer"
         self.http_read_timeout_seconds = DEFAULT_HTTP_READ_TIMEOUT_SECONDS
+        self.google_maps_api_key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
         self.current_auth_config: dict[str, Any] = self.default_auth_config()
 
         self.map_bridge = MapBridge()
@@ -806,11 +871,16 @@ class ArcGISRestExplorer(QMainWindow):
         self.draw_polygon_filter_btn = QPushButton("Draw Polygon Filter")
         self.draw_polygon_filter_btn.clicked.connect(self.enable_map_polygon_drawing)
         self.basemap_combo = QComboBox()
-        self.basemap_combo.addItems(["OpenStreetMap", "ESRI World Imagery", "ESRI Streets", "ESRI Dark Gray", "ESRI Light Gray"])
+        self.basemap_combo.addItems(list(BASEMAPS))
         self.basemap_combo.currentTextChanged.connect(self.on_basemap_changed)
+        self.map_style_combo = QComboBox()
+        self.populate_map_style_combo(self.map_style_combo)
+        self.map_style_combo.currentTextChanged.connect(self.on_map_style_changed)
         map_top.addStretch(1)
         map_top.addWidget(self.draw_area_filter_btn)
         map_top.addWidget(self.draw_polygon_filter_btn)
+        map_top.addWidget(QLabel("Style:"))
+        map_top.addWidget(self.map_style_combo)
         map_top.addWidget(QLabel("Basemap:"))
         map_top.addWidget(self.basemap_combo)
         map_layout.addWidget(self.horizontal_scroll_area(map_top_widget, 62))
@@ -1118,6 +1188,28 @@ class ArcGISRestExplorer(QMainWindow):
             },
         }
 
+    def populate_map_style_combo(self, combo: QComboBox) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        for name, preset in self.map_style_presets().items():
+            combo.addItem(name)
+            color = preset.get("fillColor") or preset.get("color")
+            if color:
+                combo.setItemData(combo.count() - 1, QColor(str(color)), Qt.ItemDataRole.DecorationRole)
+        combo.blockSignals(False)
+        self.sync_map_style_combo(combo)
+
+    def sync_map_style_combo(self, combo: QComboBox | None = None) -> None:
+        targets = [combo] if combo is not None else [getattr(self, "map_style_combo", None)]
+        for target in targets:
+            if target is None:
+                continue
+            ix = target.findText(self.map_style_preset)
+            if ix >= 0 and target.currentIndex() != ix:
+                target.blockSignals(True)
+                target.setCurrentIndex(ix)
+                target.blockSignals(False)
+
     def open_program_settings(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Program Settings")
@@ -1133,22 +1225,28 @@ class ArcGISRestExplorer(QMainWindow):
             theme_combo.setCurrentIndex(ix)
 
         map_style_combo = QComboBox()
-        map_style_combo.addItems(list(self.map_style_presets().keys()))
-        ix = map_style_combo.findText(self.map_style_preset)
-        if ix >= 0:
-            map_style_combo.setCurrentIndex(ix)
+        self.populate_map_style_combo(map_style_combo)
 
         http_timeout_spin = QSpinBox()
         http_timeout_spin.setRange(30, 1800)
         http_timeout_spin.setSuffix(" sec")
         http_timeout_spin.setValue(int(self.http_read_timeout_seconds))
 
+        google_api_key_input = QLineEdit()
+        google_api_key_input.setEchoMode(QLineEdit.Password)
+        google_api_key_input.setText(self.google_maps_api_key)
+        google_api_key_input.setPlaceholderText("Required for Google basemaps")
+
         form.addRow("Theme", theme_combo)
         form.addRow("Map object style", map_style_combo)
         form.addRow("HTTP read timeout", http_timeout_spin)
+        form.addRow("Google Maps API key", google_api_key_input)
         layout.addLayout(form)
 
-        hint = QLabel("Theme affects the full interface. Map object style applies to mapped query features. Increase HTTP read timeout for slow ArcGIS layers.")
+        hint = QLabel(
+            "Theme affects the full interface. Map object style applies to mapped query features. "
+            "Google basemaps use the official Map Tiles API and require a Google Maps Platform API key."
+        )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -1162,7 +1260,9 @@ class ArcGISRestExplorer(QMainWindow):
             if selected_theme != self.current_theme:
                 self.on_theme_changed(selected_theme)
             self.map_style_preset = map_style_combo.currentText()
+            self.sync_map_style_combo()
             self.http_read_timeout_seconds = http_timeout_spin.value()
+            self.google_maps_api_key = google_api_key_input.text().strip()
             self.draw_features_on_map(self.last_geojson_features)
             self.save_settings()
             self.statusBar().showMessage(f"Settings applied: {self.current_theme}, {self.map_style_preset}, timeout {self.http_read_timeout_seconds}s")
@@ -1192,7 +1292,9 @@ class ArcGISRestExplorer(QMainWindow):
         map_style_preset = settings.get("map_style_preset", "ArcGIS renderer")
         if map_style_preset in self.map_style_presets():
             self.map_style_preset = str(map_style_preset)
+            self.sync_map_style_combo()
         self.http_read_timeout_seconds = self.parse_timeout_setting(settings.get("http_read_timeout_seconds"))
+        self.google_maps_api_key = str(settings.get("google_maps_api_key") or os.environ.get("GOOGLE_MAPS_API_KEY", "")).strip()
 
         self.return_geometry.setChecked(bool(settings.get("return_geometry", True)))
         self.fetch_all_pages.setChecked(bool(settings.get("fetch_all_pages", False)))
@@ -1227,6 +1329,7 @@ class ArcGISRestExplorer(QMainWindow):
             "basemap": self.basemap_combo.currentText(),
             "map_style_preset": self.map_style_preset,
             "http_read_timeout_seconds": self.http_read_timeout_seconds,
+            "google_maps_api_key": self.google_maps_api_key,
             "return_geometry": self.return_geometry.isChecked(),
             "fetch_all_pages": self.fetch_all_pages.isChecked(),
             "max_records": self.max_records.currentText(),
@@ -1297,6 +1400,14 @@ class ArcGISRestExplorer(QMainWindow):
 
     def on_basemap_changed(self):
         self.draw_features_on_map(self.last_geojson_features)
+
+    def on_map_style_changed(self, style_name: str):
+        if style_name not in self.map_style_presets():
+            return
+        self.map_style_preset = style_name
+        self.draw_features_on_map(self.last_geojson_features)
+        self.save_settings()
+        self.statusBar().showMessage(f"Map style: {style_name}")
 
     def enable_map_area_drawing(self):
         if not WEBENGINE_AVAILABLE or self.map_view is None:
@@ -1391,30 +1502,11 @@ class ArcGISRestExplorer(QMainWindow):
         self.geometry_lab_input_sr_combo.setCurrentText("Auto")
         self.geometry_lab_input.setPlainText(json.dumps(payload, indent=2, ensure_ascii=False))
 
-    def get_basemap_config(self) -> dict[str, str]:
-        configs = {
-            "OpenStreetMap": {
-                "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-                "attribution": "&copy; OpenStreetMap contributors",
-            },
-            "ESRI World Imagery": {
-                "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-                "attribution": "Tiles &copy; Esri",
-            },
-            "ESRI Streets": {
-                "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
-                "attribution": "Tiles &copy; Esri",
-            },
-            "ESRI Dark Gray": {
-                "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-                "attribution": "Tiles &copy; Esri",
-            },
-            "ESRI Light Gray": {
-                "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-                "attribution": "Tiles &copy; Esri",
-            },
-        }
-        return configs.get(self.basemap_combo.currentText(), configs["OpenStreetMap"])
+    def get_basemap_config(self) -> dict[str, Any]:
+        config = dict(BASEMAPS.get(self.basemap_combo.currentText(), BASEMAPS["OpenStreetMap"]))
+        if config.get("provider") == "google":
+            config["googleApiKey"] = self.google_maps_api_key
+        return config
 
     def build_map_html(self, geojson_features: list[dict[str, Any]]) -> str:
         return build_leaflet_map_html(
