@@ -17,25 +17,43 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTextEdit,
     QVBoxLayout,
+    QWidget,
 )
 
 from . import arcgis_geometry as geom_utils
+
+
+def set_form_row_visible(form: QFormLayout, widget, visible: bool) -> None:
+    label = form.labelForField(widget)
+    if label is not None:
+        label.setVisible(visible)
+    widget.setVisible(visible)
 
 
 class GenerateTokenDialog(QDialog):
     def __init__(self, default_services_url: str, auth_config: dict[str, Any] | None = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Generate ArcGIS Token")
-        self.resize(760, 520)
+        self.resize(800, 600)
+        self.services_url = default_services_url
         self.generated_token = ""
         self.expires_text = ""
         self.auth_config = auth_config or {}
         self.mode = self.auth_config.get("mode", "server")
+        if self.mode not in ("server", "portal"):
+            self.mode = "server"
 
         layout = QVBoxLayout(self)
-        form = QFormLayout()
+        self.form = QFormLayout()
 
         token_url = self.auth_config.get("token_url") or self.default_token_url(default_services_url, self.auth_config)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("ArcGIS Server standalone", "server")
+        self.mode_combo.addItem("Federated ArcGIS Server via Portal", "portal")
+        ix = self.mode_combo.findData(self.mode)
+        self.mode_combo.setCurrentIndex(ix if ix >= 0 else 0)
+        self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
 
         self.token_url = QLineEdit(token_url)
         self.username = QLineEdit(self.auth_config.get("username", ""))
@@ -52,27 +70,42 @@ class GenerateTokenDialog(QDialog):
         self.expiration = QSpinBox()
         self.expiration.setRange(1, 20160)
         self.expiration.setValue(int(self.auth_config.get("expiration", 60)))
+        self.response_format = QComboBox()
+        self.response_format.addItem("JSON", "json")
+        self.response_format.addItem("Pretty JSON", "pjson")
+        ix = self.response_format.findData(self.auth_config.get("response_format", "json"))
+        self.response_format.setCurrentIndex(ix if ix >= 0 else 0)
         self.result = QTextEdit()
         self.result.setReadOnly(True)
         self.result.setMaximumHeight(120)
         self.help_text = QTextEdit()
         self.help_text.setReadOnly(True)
-        self.help_text.setMaximumHeight(85)
+        self.help_text.setMaximumHeight(125)
 
-        self.auth_mode_label = QLabel(f"Connection auth mode: {self.mode}")
+        self.token_endpoint_label = QLabel("Token endpoint")
         self.configure_client_options(self.mode, self.auth_config.get("client", "referer"))
         self.client_combo.currentIndexChanged.connect(self.on_client_changed)
-        form.addRow("Mode", self.auth_mode_label)
-        form.addRow("Token endpoint", self.token_url)
-        form.addRow("Username", self.username)
-        form.addRow("Password", self.password)
-        form.addRow("", self.remember_credentials)
-        form.addRow("Client", self.client_combo)
-        form.addRow("Referer", self.referer)
-        form.addRow("IP address", self.ip_address)
-        form.addRow("Federated server URL", self.server_url)
-        form.addRow("Expiration minutes", self.expiration)
-        layout.addLayout(form)
+        self.form.addRow("Scenario", self.mode_combo)
+        self.form.addRow(self.token_endpoint_label, self.token_url)
+        self.form.addRow("Username", self.username)
+        self.form.addRow("Password", self.password)
+        self.form.addRow("", self.remember_credentials)
+        self.form.addRow("Federated server URL", self.server_url)
+        layout.addLayout(self.form)
+
+        self.advanced_toggle = QPushButton("Advanced standalone parameters")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.toggled.connect(self.on_advanced_toggled)
+        self.advanced_widget = QWidget()
+        self.advanced_form = QFormLayout(self.advanced_widget)
+        self.advanced_form.setContentsMargins(18, 0, 0, 0)
+        self.advanced_form.addRow("Client", self.client_combo)
+        self.advanced_form.addRow("Referer", self.referer)
+        self.advanced_form.addRow("IP address", self.ip_address)
+        self.advanced_form.addRow("Expiration minutes", self.expiration)
+        self.advanced_form.addRow("Response format", self.response_format)
+        layout.addWidget(self.advanced_toggle)
+        layout.addWidget(self.advanced_widget)
         layout.addWidget(QLabel("REST call"))
         layout.addWidget(self.help_text)
 
@@ -86,6 +119,26 @@ class GenerateTokenDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.on_mode_changed()
+        self.on_client_changed()
+
+    def on_advanced_toggled(self, checked: bool):
+        self.advanced_widget.setVisible(checked)
+        self.on_client_changed()
+
+    def on_mode_changed(self):
+        self.mode = self.mode_combo.currentData() or "server"
+        current_client = self.client_combo.currentData() or self.auth_config.get("client", "referer")
+        self.configure_client_options(self.mode, str(current_client))
+
+        if self.mode == "portal":
+            if "/sharing/rest/generateToken" not in self.token_url.text():
+                self.token_url.clear()
+            self.token_url.setPlaceholderText("https://your-portal.example.com/portal/sharing/rest/generateToken")
+        else:
+            if not self.token_url.text().strip() or "/sharing/rest/generateToken" in self.token_url.text():
+                self.token_url.setText(self.default_token_url(self.services_url, {"mode": "server"}))
+
         self.update_mode_fields()
         self.on_client_changed()
 
@@ -137,21 +190,34 @@ class GenerateTokenDialog(QDialog):
                     self.expires_text = str(expires)
 
             preview = token[:18] + "..." + token[-8:] if len(token) > 30 else token
-            token_type = "Federated server token" if exchanged_for_server else "Token"
-            self.result.setPlainText(f"{token_type} generated.\nExpires: {self.expires_text or 'unknown'}\nPreview: {preview}")
+            if exchanged_for_server:
+                token_type = "Federated ArcGIS Server token"
+            elif self.mode == "portal":
+                token_type = "Portal token"
+            else:
+                token_type = "ArcGIS Server standalone token"
+            self.result.setPlainText(
+                f"{token_type} generated.\n"
+                f"Scenario: {self.mode_label(self.mode)}\n"
+                f"Expires: {self.expires_text or 'unknown'}\n"
+                f"Preview: {preview}"
+            )
 
         except Exception as exc:
             QMessageBox.critical(self, "Token error", str(exc))
 
     def build_credentials_payload(self) -> dict[str, str] | None:
-        client_type = self.client_combo.currentData() or "referer"
         payload = {
             "username": self.username.text().strip(),
             "password": self.password.text(),
-            "client": client_type,
             "expiration": str(self.expiration.value()),
-            "f": "json",
+            "f": self.response_format.currentData() or "json",
         }
+        if self.mode == "server" and not self.advanced_toggle.isChecked():
+            return payload
+
+        client_type = self.client_combo.currentData() or "referer"
+        payload["client"] = client_type
         if client_type == "referer":
             payload["referer"] = self.referer.text().strip() or "arcgis-rest-explorer"
         elif client_type == "ip":
@@ -180,28 +246,47 @@ class GenerateTokenDialog(QDialog):
         self.client_combo.blockSignals(False)
 
     def update_mode_fields(self):
-        self.server_url.setEnabled(self.mode == "portal")
+        self.token_endpoint_label.setText("Portal token URL" if self.mode == "portal" else "ArcGIS Server token URL")
+        is_portal = self.mode == "portal"
+        set_form_row_visible(self.form, self.server_url, is_portal)
+        self.server_url.setEnabled(is_portal)
+        if is_portal:
+            self.advanced_toggle.setText("Portal token parameters")
+            self.advanced_toggle.setChecked(True)
+        else:
+            self.advanced_toggle.setText("Advanced standalone parameters")
+            self.advanced_toggle.setChecked(False)
+        self.advanced_widget.setVisible(self.advanced_toggle.isChecked())
         if self.mode == "portal":
             self.help_text.setPlainText(
-                "Portal/federated: POST username/password to Portal generateToken. "
-                "If Federated server URL is set, a second POST exchanges the portal token with "
-                "token + serverUrl to obtain the server-token used by the Connection."
+                "Federated ArcGIS Server via Portal:\n"
+                "1. Sign in against the Portal token URL with username/password.\n"
+                "2. If Federated server URL is set, exchange that portal token for a server token using token + serverUrl.\n"
+                "Use this when the ArcGIS Server is federated and managed by Portal."
             )
         else:
             self.help_text.setPlainText(
-                "ArcGIS Server standalone: POST username/password directly to /tokens/generateToken. "
-                "Portal URL and federated serverUrl are not part of this REST call."
+                "ArcGIS Server standalone:\n"
+                "Sign in directly against the Server token URL with username/password, expiration and f=json.\n"
+                "Client, Referer, IP address, expiration and response format are available under Advanced standalone parameters."
             )
 
     def on_client_changed(self):
         client_type = self.client_combo.currentData()
-        self.referer.setEnabled(client_type == "referer")
-        self.ip_address.setEnabled(client_type == "ip")
+        advanced_visible = self.advanced_toggle.isChecked()
+        self.client_combo.setEnabled(advanced_visible)
+        self.expiration.setEnabled(advanced_visible)
+        self.response_format.setEnabled(advanced_visible)
+        set_form_row_visible(self.advanced_form, self.referer, advanced_visible and client_type == "referer")
+        set_form_row_visible(self.advanced_form, self.ip_address, advanced_visible and client_type == "ip")
+        self.referer.setEnabled(advanced_visible and client_type == "referer")
+        self.ip_address.setEnabled(advanced_visible and client_type == "ip")
 
     def get_auth_config(self) -> dict[str, Any]:
         config = dict(self.auth_config)
         config.update(
             {
+                "mode": self.mode,
                 "token_url": self.token_url.text().strip(),
                 "username": self.username.text().strip(),
                 "password": self.password.text(),
@@ -211,9 +296,25 @@ class GenerateTokenDialog(QDialog):
                 "ip": self.ip_address.text().strip(),
                 "server_url": self.server_url.text().strip().rstrip("/"),
                 "expiration": self.expiration.value(),
+                "response_format": self.response_format.currentData() or "json",
             }
         )
         return config
+
+    @staticmethod
+    def mode_label(mode: str) -> str:
+        if mode == "portal":
+            return "Federated ArcGIS Server via Portal"
+        return "ArcGIS Server standalone"
+
+    @staticmethod
+    def portal_generate_token_url(portal_url: str) -> str:
+        portal_url = portal_url.strip().rstrip("/")
+        if portal_url.endswith("/sharing/rest"):
+            return portal_url + "/generateToken"
+        if portal_url.endswith("/sharing/rest/generateToken"):
+            return portal_url
+        return portal_url + "/sharing/rest/generateToken"
 
     @staticmethod
     def default_token_url(default_services_url: str, auth_config: dict[str, Any]) -> str:
@@ -221,9 +322,7 @@ class GenerateTokenDialog(QDialog):
         if mode == "portal":
             portal_url = auth_config.get("portal_url", "").strip().rstrip("/")
             if portal_url:
-                if portal_url.endswith("/sharing/rest"):
-                    return portal_url + "/generateToken"
-                return portal_url + "/sharing/rest/generateToken"
+                return GenerateTokenDialog.portal_generate_token_url(portal_url)
 
         guessed = default_services_url.rstrip("/")
         if "/rest/services" in guessed:
@@ -249,7 +348,7 @@ class ConnectionAuthDialog(QDialog):
         self.auth_config = dict(auth_config or {})
 
         layout = QVBoxLayout(self)
-        form = QFormLayout()
+        self.form = QFormLayout()
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Manual / no token generation", "manual")
@@ -257,27 +356,39 @@ class ConnectionAuthDialog(QDialog):
         self.mode_combo.addItem("Portal / federated ArcGIS Server", "portal")
 
         self.token_url = QLineEdit()
-        self.portal_url = QLineEdit()
         self.server_url = QLineEdit()
         self.client_combo = QComboBox()
         self.referer = QLineEdit()
         self.ip_address = QLineEdit()
         self.expiration = QSpinBox()
         self.expiration.setRange(1, 20160)
+        self.response_format = QComboBox()
+        self.response_format.addItem("JSON", "json")
+        self.response_format.addItem("Pretty JSON", "pjson")
 
         self.help_text = QTextEdit()
         self.help_text.setReadOnly(True)
         self.help_text.setMaximumHeight(105)
+        self.token_endpoint_label = QLabel("Token endpoint")
 
-        form.addRow("Auth mode", self.mode_combo)
-        form.addRow("Token endpoint", self.token_url)
-        form.addRow("Portal URL", self.portal_url)
-        form.addRow("Federated server URL", self.server_url)
-        form.addRow("Client", self.client_combo)
-        form.addRow("Referer", self.referer)
-        form.addRow("IP address", self.ip_address)
-        form.addRow("Expiration minutes", self.expiration)
-        layout.addLayout(form)
+        self.form.addRow("Auth mode", self.mode_combo)
+        self.form.addRow(self.token_endpoint_label, self.token_url)
+        self.form.addRow("Federated server URL", self.server_url)
+        layout.addLayout(self.form)
+
+        self.advanced_toggle = QPushButton("Advanced standalone parameters")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.toggled.connect(self.on_advanced_toggled)
+        self.advanced_widget = QWidget()
+        self.advanced_form = QFormLayout(self.advanced_widget)
+        self.advanced_form.setContentsMargins(18, 0, 0, 0)
+        self.advanced_form.addRow("Client", self.client_combo)
+        self.advanced_form.addRow("Referer", self.referer)
+        self.advanced_form.addRow("IP address", self.ip_address)
+        self.advanced_form.addRow("Expiration minutes", self.expiration)
+        self.advanced_form.addRow("Response format", self.response_format)
+        layout.addWidget(self.advanced_toggle)
+        layout.addWidget(self.advanced_widget)
         layout.addWidget(QLabel("Notes"))
         layout.addWidget(self.help_text)
 
@@ -290,17 +401,22 @@ class ConnectionAuthDialog(QDialog):
         self.client_combo.currentIndexChanged.connect(self.on_client_changed)
         self.load_values()
 
+    def on_advanced_toggled(self, checked: bool):
+        self.advanced_widget.setVisible(checked)
+        self.on_client_changed()
+
     def load_values(self):
         mode = self.auth_config.get("mode", "server")
         ix = self.mode_combo.findData(mode)
         self.mode_combo.setCurrentIndex(ix if ix >= 0 else 1)
         self.token_url.setText(self.auth_config.get("token_url") or GenerateTokenDialog.default_token_url(self.services_url, self.auth_config))
-        self.portal_url.setText(self.auth_config.get("portal_url", ""))
         self.server_url.setText(self.auth_config.get("server_url") or GenerateTokenDialog.default_server_url(self.services_url))
         self.configure_client_options(mode, self.auth_config.get("client", "referer"))
         self.referer.setText(self.auth_config.get("referer", "arcgis-rest-explorer"))
         self.ip_address.setText(self.auth_config.get("ip", ""))
         self.expiration.setValue(int(self.auth_config.get("expiration", 60)))
+        ix = self.response_format.findData(self.auth_config.get("response_format", "json"))
+        self.response_format.setCurrentIndex(ix if ix >= 0 else 0)
         self.on_mode_changed()
         self.on_client_changed()
 
@@ -308,24 +424,30 @@ class ConnectionAuthDialog(QDialog):
         mode = self.mode_combo.currentData()
         current_client = self.client_combo.currentData() or self.auth_config.get("client", "referer")
         self.configure_client_options(mode, str(current_client))
-        self.portal_url.setEnabled(mode == "portal")
-        self.server_url.setEnabled(mode == "portal")
+        is_portal = mode == "portal"
+        self.token_endpoint_label.setText("Portal token URL" if is_portal else "ArcGIS Server token URL")
+        set_form_row_visible(self.form, self.server_url, is_portal)
+        self.server_url.setEnabled(is_portal)
         self.token_url.setEnabled(mode != "manual")
-        self.client_combo.setEnabled(mode != "manual")
-        self.referer.setEnabled(mode != "manual")
-        self.ip_address.setEnabled(mode != "manual")
-        self.expiration.setEnabled(mode != "manual")
-        if mode == "portal" and not self.portal_url.text().strip():
-            self.portal_url.setPlaceholderText("https://your-portal.example.com/portal")
+        if is_portal:
+            self.advanced_toggle.setText("Portal token parameters")
+            self.advanced_toggle.setChecked(True)
+        else:
+            self.advanced_toggle.setText("Advanced standalone parameters")
+            self.advanced_toggle.setChecked(False)
+        self.advanced_widget.setVisible(self.advanced_toggle.isChecked())
+        if mode == "portal" and "/sharing/rest/generateToken" not in self.token_url.text():
+            self.token_url.clear()
+            self.token_url.setPlaceholderText("https://your-portal.example.com/portal/sharing/rest/generateToken")
         if mode == "server":
             self.help_text.setPlainText(
                 "ArcGIS Server standalone uses /tokens/generateToken with username, password, "
-                "client, referer or ip, expiration and f=json. Portal URL and Federated server URL "
-                "are disabled because they are not request parameters for standalone Server."
+                "expiration and f=json. Client, Referer, IP address, expiration and response format "
+                "are available under Advanced standalone parameters."
             )
         elif mode == "portal":
             self.help_text.setPlainText(
-                "Portal/federated uses Portal /sharing/rest/generateToken with username/password "
+                "Portal/federated uses the Portal token URL with username/password "
                 "to get a portal token. If Federated server URL is set, Generate Token then makes "
                 "a second call with token + serverUrl to obtain the server-token for the Connection."
             )
@@ -348,23 +470,27 @@ class ConnectionAuthDialog(QDialog):
         self.client_combo.blockSignals(False)
 
     def on_client_changed(self):
-        mode = self.mode_combo.currentData()
         client_type = self.client_combo.currentData()
-        enabled = mode != "manual"
-        self.referer.setEnabled(enabled and client_type == "referer")
-        self.ip_address.setEnabled(enabled and client_type == "ip")
+        advanced_visible = self.advanced_toggle.isChecked()
+        self.client_combo.setEnabled(advanced_visible)
+        self.expiration.setEnabled(advanced_visible)
+        self.response_format.setEnabled(advanced_visible)
+        set_form_row_visible(self.advanced_form, self.referer, advanced_visible and client_type == "referer")
+        set_form_row_visible(self.advanced_form, self.ip_address, advanced_visible and client_type == "ip")
+        self.referer.setEnabled(advanced_visible and client_type == "referer")
+        self.ip_address.setEnabled(advanced_visible and client_type == "ip")
 
     def get_auth_config(self) -> dict[str, Any]:
         mode = self.mode_combo.currentData()
         return {
             "mode": mode,
             "token_url": self.token_url.text().strip(),
-            "portal_url": self.portal_url.text().strip(),
             "server_url": self.server_url.text().strip().rstrip("/"),
             "client": self.client_combo.currentData() or "referer",
             "referer": self.referer.text().strip() or "arcgis-rest-explorer",
             "ip": self.ip_address.text().strip(),
             "expiration": self.expiration.value(),
+            "response_format": self.response_format.currentData() or "json",
         }
 
 
@@ -469,5 +595,3 @@ class GeometryLabDialog(QDialog):
 
     def geojson_geometry_to_arcgis(self, geom: dict[str, Any]) -> tuple[dict[str, Any], str]:
         return geom_utils.geojson_geometry_to_arcgis(geom)
-
-

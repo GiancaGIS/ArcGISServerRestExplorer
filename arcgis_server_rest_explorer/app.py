@@ -639,7 +639,7 @@ class ArcGISRestExplorer(QMainWindow):
         self.delete_conn_btn.clicked.connect(self.delete_current_connection)
         self.auth_settings_btn = QPushButton("Auth")
         self.auth_settings_btn.clicked.connect(self.open_connection_auth_settings)
-        self.generate_token_btn = QPushButton("Generate Token")
+        self.generate_token_btn = QPushButton("Generate Token...")
         self.generate_token_btn.clicked.connect(self.open_generate_token_dialog)
         self.clear_token_btn = QPushButton("Clear Token")
         self.clear_token_btn.clicked.connect(self.clear_current_token)
@@ -2948,8 +2948,8 @@ class ArcGISRestExplorer(QMainWindow):
         mode = (self.current_auth_config or {}).get("mode", "server")
         mode_label = {
             "manual": "manual",
-            "server": "server",
-            "portal": "portal/federated",
+            "server": "ArcGIS Server standalone",
+            "portal": "Federated via Portal",
         }.get(mode, mode)
         token = self.get_token()
         if not token:
