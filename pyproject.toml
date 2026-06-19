@@ -24,7 +24,7 @@ test = [
 ]
 
 [project.scripts]
-arcgis-rest-explorer = "arcgis_server_rest_explorer.app:main"
+arcgis-server-rest-explorer = "arcgis_server_rest_explorer.app:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

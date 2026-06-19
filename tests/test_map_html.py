@@ -1,4 +1,4 @@
-﻿from importlib.resources import files
+﻿﻿from importlib.resources import files
 
 from arcgis_server_rest_explorer.map_html import build_leaflet_map_html, script_json
 

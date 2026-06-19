@@ -4,11 +4,22 @@ Desktop ArcGIS Server REST service explorer built with PySide6.
 
 It lets you browse ArcGIS Server and Portal/federated REST services, inspect layer metadata, build queries, preview features on a Leaflet map, use spatial filters, and export responses/results.
 
+## Screenshots
+
+![Main window](images/main_window.png)
+
+Screenshots may show public ArcGIS REST services from Comune di Milano / Geoportale Milano.
+Data and service URLs are used only as public examples. Comune di Milano data is attributed to Comune di Milano / Portale del Dato, under the applicable open-data license unless otherwise stated by the source.
+
+This project is not affiliated with or endorsed by Comune di Milano. Basemap attribution is shown in the map screenshots where applicable.
+
 ## Highlights
 
 - Browse ArcGIS REST service catalogs, folders, services, layers, and tables.
 - Layer metadata summary in the main UI and full metadata from the catalog context menu.
 - Visual query builder with row-based conditions, `AND/OR` joins, live SQL preview, and manual `WHERE` override.
+- Operations tab for read-only layer operations and GPServer task execution.
+- GPServer async `submitJob` support with job status polling.
 - `outSR=4326` is requested when geometry is returned, so map rendering is more reliable.
 - `Fetch all pages` supports ArcGIS pagination and uses a limited parallel fetch pool.
 - Result table with context-menu export to CSV or XLSX.
@@ -30,11 +41,18 @@ Supported connection auth modes:
 - `ArcGIS Server standalone`
 - `Portal / federated ArcGIS Server`
 
+Standalone ArcGIS Server token generation:
+
+![ArcGIS Server standalone token generation](images/gen_token_standalone.png)
+
+Portal/federated ArcGIS Server token generation:
+
+![Portal federated token generation](images/gen_token_federated.png)
+
 Each connection can store its own non-secret auth settings:
 
 - auth mode
 - token endpoint
-- Portal URL
 - referer
 - expiration minutes
 

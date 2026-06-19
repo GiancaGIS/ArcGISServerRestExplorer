@@ -19,7 +19,7 @@ def build_query_params(
     }
 
     if return_geometry:
-        params["outSR"] = "3857"
+        params["outSR"] = "4326"
 
     if order_by.strip():
         params["orderByFields"] = order_by.strip()

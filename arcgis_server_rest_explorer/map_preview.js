@@ -1,4 +1,4 @@
-﻿let bridge = null;
+﻿﻿let bridge = null;
 new QWebChannel(qt.webChannelTransport, function(channel) {
     bridge = channel.objects.bridge;
 });

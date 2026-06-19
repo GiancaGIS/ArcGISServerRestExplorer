@@ -5,15 +5,14 @@ import os
 import sys
 import time
 import zipfile
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from xml.sax.saxutils import escape
 
 import httpx
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot, qVersion
+from PySide6.QtCore import Qt, QTimer, QUrl, qVersion
 from PySide6.QtGui import QAction, QColor, QDesktopServices
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWidgets import (
@@ -50,6 +49,7 @@ from PySide6.QtWidgets import (
 
 from . import __author__, __version__
 from . import arcgis_geometry as geom_utils
+from .basemaps import BASEMAPS
 from .credentials import (
     KEYRING_AVAILABLE,
     delete_credentials,
@@ -60,9 +60,25 @@ from .credentials import (
     save_token,
 )
 from .dialogs import ConnectionAuthDialog, GenerateTokenDialog, GeometryLabDialog
+from .map_bridge import MapBridge
 from .map_html import build_leaflet_map_html
+from .map_styles import MAP_STYLE_PRESETS, arcgis_color_to_hex, build_leaflet_style_from_renderer
+from .models import ArcGISNodeData
+from .operations import (
+    build_gp_task_summary,
+    default_gp_input_params,
+    gp_operation_definitions,
+    layer_operation_definitions,
+    normalize_gp_input_params,
+)
 from .query_utils import build_query_params
 from .storage import atomic_write_json, backup_corrupt_json, load_json_file
+from .workers import (
+    DEFAULT_HTTP_READ_TIMEOUT_SECONDS,
+    FetchAllWorker,
+    GpJobWorker,
+    HttpWorker,
+)
 
 try:
     from PySide6.QtWebEngineCore import QWebEngineSettings
@@ -98,70 +114,6 @@ GEOMETRY_HISTORY_FILE = APP_DIR / "geometry_history.json"
 LOG_FILE = APP_DIR / "arcgis_rest_explorer.log"
 MAP_HTML_FILE = APP_DIR / "map_preview.html"
 MAP_SETHTML_MAX_CHARS = 1_500_000
-BASEMAPS: dict[str, dict[str, Any]] = {
-    "OpenStreetMap": {
-        "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-        "attribution": "&copy; OpenStreetMap contributors",
-    },
-    "ESRI World Imagery": {
-        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        "attribution": "Tiles &copy; Esri",
-    },
-    "ESRI Streets": {
-        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
-        "attribution": "Tiles &copy; Esri",
-    },
-    "ESRI Topographic": {
-        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
-        "attribution": "Tiles &copy; Esri",
-    },
-    "ESRI Terrain": {
-        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{z}/{y}/{x}",
-        "attribution": "Tiles &copy; Esri",
-        "maxNativeZoom": 13,
-    },
-    "ESRI Oceans": {
-        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}",
-        "attribution": "Tiles &copy; Esri",
-        "maxNativeZoom": 10,
-    },
-    "ESRI National Geographic": {
-        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/NatGeo_World_Map/MapServer/tile/{z}/{y}/{x}",
-        "attribution": "Tiles &copy; Esri",
-        "maxNativeZoom": 16,
-    },
-    "ESRI Shaded Relief": {
-        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Shaded_Relief/MapServer/tile/{z}/{y}/{x}",
-        "attribution": "Tiles &copy; Esri",
-        "maxNativeZoom": 13,
-    },
-    "ESRI Dark Gray": {
-        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-        "attribution": "Tiles &copy; Esri",
-    },
-    "ESRI Light Gray": {
-        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-        "attribution": "Tiles &copy; Esri",
-    },
-    "Google Roadmap": {
-        "provider": "google",
-        "googleMapType": "roadmap",
-        "attribution": "Map data &copy; Google",
-        "maxZoom": 22,
-    },
-    "Google Satellite": {
-        "provider": "google",
-        "googleMapType": "satellite",
-        "attribution": "Map data &copy; Google",
-        "maxZoom": 22,
-    },
-    "Google Terrain": {
-        "provider": "google",
-        "googleMapType": "terrain",
-        "attribution": "Map data &copy; Google",
-        "maxZoom": 22,
-    },
-}
 
 
 def migrate_legacy_data_files() -> None:
@@ -184,226 +136,6 @@ logger = logging.getLogger(__name__)
 JSON_FEATURE_PREVIEW_LIMIT = 100
 TABLE_FEATURE_INITIAL_CHUNK_SIZE = 1000
 TABLE_FEATURE_CHUNK_SIZE = 1000
-DEFAULT_HTTP_READ_TIMEOUT_SECONDS = 180
-
-
-def build_http_timeout(read_timeout_seconds: int | float = DEFAULT_HTTP_READ_TIMEOUT_SECONDS) -> httpx.Timeout:
-    return httpx.Timeout(
-        connect=20.0,
-        read=float(read_timeout_seconds),
-        write=60.0,
-        pool=20.0,
-    )
-
-
-class FetchCancelled(Exception):
-    pass
-
-
-@dataclass
-class ArcGISNodeData:
-    kind: str
-    url: str
-    name: str = ""
-
-
-class MapBridge(QObject):
-    featureClicked = Signal(int)
-    areaDrawn = Signal(float, float, float, float)
-    polygonDrawn = Signal(str)
-
-    @Slot(int)
-    def onFeatureClicked(self, feature_index: int):
-        self.featureClicked.emit(feature_index)
-
-    @Slot(float, float, float, float)
-    def onAreaDrawn(self, west: float, south: float, east: float, north: float):
-        self.areaDrawn.emit(west, south, east, north)
-
-    @Slot(str)
-    def onPolygonDrawn(self, coordinates_json: str):
-        self.polygonDrawn.emit(coordinates_json)
-
-
-class HttpWorker(QThread):
-    ok = Signal(object, float)
-    fail = Signal(str)
-
-    def __init__(self, url: str, params: dict[str, Any] | None = None, read_timeout_seconds: int = DEFAULT_HTTP_READ_TIMEOUT_SECONDS):
-        super().__init__()
-        self.url = url
-        self.params = params or {}
-        self.read_timeout_seconds = read_timeout_seconds
-
-    def run(self):
-        started = time.perf_counter()
-        try:
-            params = dict(self.params)
-            params.setdefault("f", "json")
-
-            with httpx.Client(timeout=build_http_timeout(self.read_timeout_seconds), follow_redirects=True) as client:
-                if self.isInterruptionRequested():
-                    return
-                response = client.post(self.url, params=params)
-                if self.isInterruptionRequested():
-                    return
-                response.raise_for_status()
-                data = response.json()
-                if self.isInterruptionRequested():
-                    return
-
-                if isinstance(data, dict) and "error" in data:
-                    err = data["error"]
-                    message = err.get("message", "ArcGIS Server REST error")
-                    details = err.get("details", [])
-                    code = err.get("code", "")
-                    detail_text = "\n".join(str(d) for d in details)
-                    raise RuntimeError(f"ArcGIS error {code}: {message}\n{detail_text}".strip())
-
-                elapsed_ms = (time.perf_counter() - started) * 1000
-                self.ok.emit(data, elapsed_ms)
-
-        except httpx.TimeoutException as exc:
-            logger.exception("HTTP request timed out")
-            self.fail.emit(f"Request timed out after {self.read_timeout_seconds} seconds while waiting for the server response: {exc}")
-        except Exception as exc:
-            logger.exception("HTTP request failed")
-            self.fail.emit(str(exc))
-
-
-class FetchAllWorker(QThread):
-    ok = Signal(object, float, int)
-    fail = Signal(str)
-    cancelled = Signal()
-    progress = Signal(int, int)
-
-    def __init__(self, url: str, params: dict[str, Any], page_size: int, max_workers: int = 4, read_timeout_seconds: int = DEFAULT_HTTP_READ_TIMEOUT_SECONDS):
-        super().__init__()
-        self.url = url
-        self.params = dict(params)
-        self.page_size = max(1, int(page_size))
-        self.max_workers = max(1, int(max_workers))
-        self.read_timeout_seconds = read_timeout_seconds
-
-    def run(self):
-        started = time.perf_counter()
-        try:
-            with httpx.Client(timeout=build_http_timeout(self.read_timeout_seconds), follow_redirects=True) as client:
-                self.raise_if_cancelled()
-                total = self.fetch_count(client)
-                self.raise_if_cancelled()
-                if total == 0:
-                    elapsed_ms = (time.perf_counter() - started) * 1000
-                    self.ok.emit({"features": [], "count": 0, "pagesFetched": 0, "parallelFetch": True}, elapsed_ms, 0)
-                    return
-
-                offsets = list(range(0, total, self.page_size))
-                pages: dict[int, dict[str, Any]] = {}
-                completed = 0
-                pool = ThreadPoolExecutor(max_workers=min(self.max_workers, len(offsets)))
-                futures = {
-                    pool.submit(self.fetch_page, offset): offset
-                    for offset in offsets
-                }
-                pending = set(futures)
-                try:
-                    while pending:
-                        self.raise_if_cancelled()
-                        done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
-                        for future in done:
-                            self.raise_if_cancelled()
-                            offset = futures[future]
-                            pages[offset] = future.result()
-                            completed += 1
-                            self.progress.emit(completed, len(offsets))
-                except FetchCancelled:
-                    for future in pending:
-                        future.cancel()
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    raise
-                except Exception:
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    raise
-                else:
-                    pool.shutdown(wait=True)
-
-                features: list[dict[str, Any]] = []
-                template: dict[str, Any] = {}
-                for offset in sorted(pages):
-                    page = pages[offset]
-                    if not template:
-                        template = dict(page)
-                    features.extend(page.get("features", []))
-
-                combined = template or {}
-                combined["features"] = features
-                combined["count"] = total
-                combined["pagesFetched"] = len(offsets)
-                combined["parallelFetch"] = True
-                combined["exceededTransferLimit"] = len(features) < total
-
-                elapsed_ms = (time.perf_counter() - started) * 1000
-                self.ok.emit(combined, elapsed_ms, len(offsets))
-        except FetchCancelled:
-            logger.info("Parallel fetch cancelled")
-            self.cancelled.emit()
-        except httpx.TimeoutException as exc:
-            logger.exception("Parallel fetch all timed out")
-            self.fail.emit(f"Parallel fetch timed out after {self.read_timeout_seconds} seconds while waiting for a server response: {exc}")
-        except Exception as exc:
-            logger.exception("Parallel fetch all failed")
-            self.fail.emit(str(exc))
-
-    def raise_if_cancelled(self) -> None:
-        if self.isInterruptionRequested():
-            raise FetchCancelled()
-
-    def fetch_count(self, client: httpx.Client) -> int:
-        params = dict(self.params)
-        params.setdefault("f", "json")
-        params["returnCountOnly"] = "true"
-        params["returnGeometry"] = "false"
-        params.pop("resultOffset", None)
-        params.pop("resultRecordCount", None)
-        params.pop("outFields", None)
-        params.pop("orderByFields", None)
-        params.pop("outSR", None)
-
-        response = client.get(self.url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        self.raise_for_arcgis_error(data)
-        count = data.get("count")
-        if not isinstance(count, int):
-            raise RuntimeError("ArcGIS count request did not return an integer 'count'.")
-        return count
-
-    def fetch_page(self, offset: int) -> dict[str, Any]:
-        self.raise_if_cancelled()
-        params = dict(self.params)
-        params.setdefault("f", "json")
-        params["resultOffset"] = str(offset)
-        params["resultRecordCount"] = str(self.page_size)
-
-        with httpx.Client(timeout=build_http_timeout(self.read_timeout_seconds), follow_redirects=True) as client:
-            response = client.post(self.url, params=params)
-            response.raise_for_status()
-            data = response.json()
-        self.raise_if_cancelled()
-        self.raise_for_arcgis_error(data)
-        if not isinstance(data, dict):
-            raise RuntimeError("ArcGIS page request did not return a JSON object.")
-        return data
-
-    @staticmethod
-    def raise_for_arcgis_error(data: object) -> None:
-        if isinstance(data, dict) and "error" in data:
-            err = data["error"]
-            message = err.get("message", "ArcGIS Server REST error")
-            details = err.get("details", [])
-            code = err.get("code", "")
-            detail_text = "\n".join(str(d) for d in details)
-            raise RuntimeError(f"ArcGIS error {code}: {message}\n{detail_text}".strip())
 
 
 
@@ -417,6 +149,9 @@ class ArcGISRestExplorer(QMainWindow):
         self.current_layer_url: str | None = None
         self.current_layer_metadata: dict[str, Any] | None = None
         self.current_layer_metadata_url: str | None = None
+        self.current_operation_url: str | None = None
+        self.current_operation_kind: str | None = None
+        self.current_operation_metadata: dict[str, Any] | None = None
         self.last_response: dict[str, Any] | list[Any] | None = None
         self.last_geojson_features: list[dict[str, Any]] = []
         self.query_features: list[dict[str, Any]] = []
@@ -426,9 +161,11 @@ class ArcGISRestExplorer(QMainWindow):
         self.loading_table_chunk = False
         self.worker: HttpWorker | None = None
         self.fetch_all_worker: FetchAllWorker | None = None
+        self.gp_job_worker: GpJobWorker | None = None
         self.workers: dict[int, HttpWorker] = {}
         self.request_counter = 0
         self.active_request_id = 0
+        self.gp_job_request_id = 0
         self.connections: list[dict[str, str]] = []
         self.collections: list[dict[str, Any]] = []
         self.history: list[dict[str, Any]] = []
@@ -696,8 +433,8 @@ class ArcGISRestExplorer(QMainWindow):
         collections_bar = QHBoxLayout()
         collections_bar.setContentsMargins(0, 0, 0, 0)
         collections_bar.setSpacing(8)
-        self.save_query_btn = QPushButton("Save Query")
-        self.save_query_btn.clicked.connect(self.save_current_query_to_collection)
+        self.save_query_btn = QPushButton("Save Call")
+        self.save_query_btn.clicked.connect(self.save_current_call_to_collection)
         self.load_query_btn = QPushButton("Load")
         self.load_query_btn.clicked.connect(self.load_selected_collection_query)
         self.delete_query_btn = QPushButton("Delete")
@@ -707,8 +444,8 @@ class ArcGISRestExplorer(QMainWindow):
         collections_bar.addWidget(self.delete_query_btn)
 
         self.collections_tree = QTreeWidget()
-        self.collections_tree.setHeaderLabels(["Saved Queries", "Layer"])
-        self.collections_tree.itemDoubleClicked.connect(lambda *_: self.load_selected_collection_query())
+        self.collections_tree.setHeaderLabels(["Saved Calls", "Target"])
+        self.collections_tree.itemDoubleClicked.connect(lambda *_: self.load_selected_collection_call())
 
         self.history_tree = QTreeWidget()
         self.history_tree.setHeaderLabels(["History", "ms"])
@@ -727,7 +464,7 @@ class ArcGISRestExplorer(QMainWindow):
         history_layout.addWidget(self.history_tree)
 
         self.left_activity_tabs = QTabWidget()
-        self.left_activity_tabs.addTab(collections_panel, "Saved Collections")
+        self.left_activity_tabs.addTab(collections_panel, "Saved Calls")
         self.left_activity_tabs.addTab(history_panel, "History")
         left_layout.addWidget(self.left_activity_tabs, 2)
         main_splitter.addWidget(left)
@@ -828,7 +565,39 @@ class ArcGISRestExplorer(QMainWindow):
         query_layout.addWidget(self.toggle_metadata_btn)
         query_layout.addWidget(self.metadata_label)
         query_layout.addWidget(self.metadata_text)
-        mid_splitter.addWidget(self.wrap_scroll_area(query_panel))
+
+        operations_panel = QWidget()
+        operations_layout = QVBoxLayout(operations_panel)
+        operations_form = QFormLayout()
+        self.operation_target_label = QLabel("No REST operation target selected")
+        self.operation_combo = QComboBox()
+        self.operation_combo.currentIndexChanged.connect(self.on_operation_changed)
+        self.operation_params = QTextEdit()
+        self.operation_params.setMinimumHeight(160)
+        self.operation_params.setPlaceholderText('JSON parameters, for example: {"where": "1=1"}')
+        self.run_operation_btn = QPushButton("Run Operation")
+        self.run_operation_btn.clicked.connect(self.run_selected_operation)
+        self.operation_status = QTextEdit()
+        self.operation_status.setReadOnly(True)
+        self.operation_status.setMaximumHeight(120)
+        self.operation_output = QTextEdit()
+        self.operation_output.setReadOnly(True)
+        self.operation_output.setMinimumHeight(180)
+        operations_form.addRow("Target", self.operation_target_label)
+        operations_form.addRow("Operation", self.operation_combo)
+        operations_form.addRow("Parameters", self.operation_params)
+        operations_form.addRow("", self.run_operation_btn)
+        operations_layout.addLayout(operations_form)
+        operations_layout.addWidget(QLabel("Job / Operation Status"))
+        operations_layout.addWidget(self.operation_status)
+        operations_layout.addWidget(QLabel("Operation Output"))
+        operations_layout.addWidget(self.operation_output)
+        self.update_operation_panel(None, None, None)
+
+        self.request_tabs = QTabWidget()
+        self.request_tabs.addTab(self.wrap_scroll_area(query_panel), "Query")
+        self.request_tabs.addTab(self.wrap_scroll_area(operations_panel), "Operations")
+        mid_splitter.addWidget(self.request_tabs)
 
         self.table = QTableWidget()
         self.table.itemSelectionChanged.connect(self.on_table_selection_changed)
@@ -1144,49 +913,7 @@ class ArcGISRestExplorer(QMainWindow):
             return DEFAULT_HTTP_READ_TIMEOUT_SECONDS
 
     def map_style_presets(self) -> dict[str, dict[str, Any]]:
-        return {
-            "ArcGIS renderer": {},
-            "Blue solid": {
-                "color": "#1d4ed8",
-                "fillColor": "#60a5fa",
-                "weight": 2,
-                "opacity": 0.95,
-                "fillOpacity": 0.35,
-                "radius": 7,
-            },
-            "Orange focus": {
-                "color": "#ea580c",
-                "fillColor": "#fb923c",
-                "weight": 3,
-                "opacity": 1.0,
-                "fillOpacity": 0.28,
-                "radius": 8,
-            },
-            "Emerald light": {
-                "color": "#047857",
-                "fillColor": "#34d399",
-                "weight": 2,
-                "opacity": 0.95,
-                "fillOpacity": 0.30,
-                "radius": 7,
-            },
-            "High contrast": {
-                "color": "#facc15",
-                "fillColor": "#000000",
-                "weight": 4,
-                "opacity": 1.0,
-                "fillOpacity": 0.15,
-                "radius": 9,
-            },
-            "Hollow outline": {
-                "color": "#ef4444",
-                "fillColor": "#ef4444",
-                "weight": 3,
-                "opacity": 1.0,
-                "fillOpacity": 0.0,
-                "radius": 8,
-            },
-        }
+        return MAP_STYLE_PRESETS
 
     def populate_map_style_combo(self, combo: QComboBox) -> None:
         combo.blockSignals(True)
@@ -1517,44 +1244,11 @@ class ArcGISRestExplorer(QMainWindow):
         )
 
     def get_leaflet_style_from_arcgis_renderer(self) -> dict[str, Any]:
-        meta = self.current_layer_metadata or {}
-        renderer = meta.get("drawingInfo", {}).get("renderer", {})
-        style = {"color": "#60a5fa", "fillColor": "#60a5fa", "weight": 2, "opacity": 0.95, "fillOpacity": 0.30, "radius": 7, "rendererType": renderer.get("type") if isinstance(renderer, dict) else None}
-        preset = self.map_style_presets().get(self.map_style_preset, {})
-        if preset:
-            return {**style, **preset, "rendererType": f"preset:{self.map_style_preset}"}
-        if not isinstance(renderer, dict):
-            return style
-        symbol = renderer.get("symbol")
-        if not isinstance(symbol, dict):
-            return style
-
-        color = symbol.get("color")
-        outline = symbol.get("outline", {})
-        outline_color = outline.get("color") if isinstance(outline, dict) else None
-
-        if isinstance(color, list) and len(color) >= 3:
-            style["fillColor"] = self.arcgis_color_to_hex(color)
-            if len(color) >= 4:
-                style["fillOpacity"] = round(color[3] / 255, 2)
-        if isinstance(outline_color, list) and len(outline_color) >= 3:
-            style["color"] = self.arcgis_color_to_hex(outline_color)
-        if symbol.get("size"):
-            try:
-                style["radius"] = max(4, float(symbol["size"]) / 2)
-            except Exception:
-                pass
-        if isinstance(outline, dict) and outline.get("width"):
-            try:
-                style["weight"] = max(1, float(outline["width"]))
-            except Exception:
-                pass
-        return style
+        return build_leaflet_style_from_renderer(self.current_layer_metadata, self.map_style_preset)
 
     @staticmethod
     def arcgis_color_to_hex(color: list[int]) -> str:
-        r, g, b = color[:3]
-        return QColor(int(r), int(g), int(b)).name()
+        return arcgis_color_to_hex(color)
 
     # ---------------- HTTP / Connection ----------------
 
@@ -1603,6 +1297,10 @@ class ArcGISRestExplorer(QMainWindow):
     def set_busy(self, busy: bool):
         self.connect_btn.setEnabled(not busy)
         self.query_btn.setEnabled(not busy)
+        if hasattr(self, "run_operation_btn"):
+            self.run_operation_btn.setEnabled(not busy and self.operation_combo.count() > 0)
+        if hasattr(self, "operation_combo"):
+            self.operation_combo.setEnabled(not busy)
         self.fetch_all_pages.setEnabled(not busy)
         self.draw_area_filter_btn.setEnabled(not busy)
         self.draw_polygon_filter_btn.setEnabled(not busy)
@@ -1633,12 +1331,19 @@ class ArcGISRestExplorer(QMainWindow):
             and self.fetch_all_request_id == self.active_request_id
         )
 
+    def is_gp_job_running(self) -> bool:
+        return (
+            self.gp_job_worker is not None
+            and self.gp_job_worker.isRunning()
+            and self.gp_job_request_id == self.active_request_id
+        )
+
     def is_standard_request_running(self) -> bool:
         worker = self.workers.get(self.active_request_id)
         return worker is not None and worker.isRunning()
 
     def is_request_running(self) -> bool:
-        return self.is_parallel_fetch_running() or self.is_standard_request_running()
+        return self.is_parallel_fetch_running() or self.is_standard_request_running() or self.is_gp_job_running()
 
     def update_stop_query_button(self):
         if not hasattr(self, "stop_query_btn"):
@@ -1832,6 +1537,7 @@ class ArcGISRestExplorer(QMainWindow):
         self.current_layer_url = None
         self.current_layer_metadata = None
         self.current_layer_metadata_url = None
+        self.update_operation_panel(None, None, None)
         self.table.clear()
         self.metadata_text.clear()
         self.query_builder_fields = []
@@ -1886,6 +1592,17 @@ class ArcGISRestExplorer(QMainWindow):
     def populate_service(self, parent: QTreeWidgetItem, data: dict[str, Any], service_url: str):
         self.response_text.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
 
+        if service_url.rstrip("/").endswith("/GPServer"):
+            for task in data.get("tasks", []):
+                task_name = task.get("name") if isinstance(task, dict) else str(task)
+                if not task_name:
+                    continue
+                task_url = f"{service_url.rstrip('/')}/{quote(task_name, safe='')}"
+                item = QTreeWidgetItem([f"{task_name} [GP Task]"])
+                item.setData(0, Qt.UserRole, ArcGISNodeData("gp_task", task_url, task_name))
+                parent.addChild(item)
+            return
+
         for layer in data.get("layers", []):
             layer_id = layer.get("id")
             name = layer.get("name", f"Layer {layer_id}")
@@ -1908,6 +1625,11 @@ class ArcGISRestExplorer(QMainWindow):
         if isinstance(data, ArcGISNodeData) and data.kind == "layer":
             self.current_layer_url = data.url
             self._get_json(data.url, self.show_layer_metadata)
+        elif isinstance(data, ArcGISNodeData) and data.kind == "gp_task":
+            self.current_layer_url = None
+            self.current_layer_metadata = None
+            self.current_layer_metadata_url = None
+            self._get_json(data.url, lambda json_data, node=data: self.show_gp_task_metadata(node, json_data))
 
     def open_catalog_context_menu(self, pos):
         item = self.tree.itemAt(pos)
@@ -1976,6 +1698,7 @@ class ArcGISRestExplorer(QMainWindow):
     def show_layer_metadata(self, data: dict[str, Any], show_popup: bool = False):
         self.current_layer_metadata = data
         self.current_layer_metadata_url = self.current_layer_url
+        self.update_operation_panel("layer", self.current_layer_url, data)
         self.populate_query_builder_fields()
 
         useful = self.build_layer_metadata_summary(data)
@@ -1985,6 +1708,18 @@ class ArcGISRestExplorer(QMainWindow):
         self.statusBar().showMessage(f"Layer selected: {data.get('name', '')}")
         if show_popup:
             self.show_layer_metadata_popup(data)
+
+    def show_gp_task_metadata(self, node: ArcGISNodeData, data: dict[str, Any]):
+        self.current_operation_url = node.url
+        self.current_operation_kind = "gp_task"
+        self.current_operation_metadata = data if isinstance(data, dict) else {}
+        self.update_operation_panel("gp_task", node.url, self.current_operation_metadata)
+        self.response_text.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
+        self.metadata_text.setPlainText(json.dumps(self.build_gp_task_summary(self.current_operation_metadata), ensure_ascii=False, separators=(",", ":")))
+        self.statusBar().showMessage(f"GP task selected: {node.name}")
+
+    def build_gp_task_summary(self, data: dict[str, Any]) -> dict[str, Any]:
+        return build_gp_task_summary(data)
 
     def show_layer_metadata_popup(self, data: dict[str, Any]):
         dialog = QDialog(self)
@@ -2204,6 +1939,189 @@ class ArcGISRestExplorer(QMainWindow):
 
         return f"'{text}'"
 
+    # ---------------- REST Operations / GP Jobs ----------------
+
+    def update_operation_panel(self, kind: str | None, url: str | None, metadata: dict[str, Any] | None):
+        if not hasattr(self, "operation_combo"):
+            return
+        self.current_operation_kind = kind
+        self.current_operation_url = url
+        self.current_operation_metadata = metadata or {}
+        self.operation_combo.blockSignals(True)
+        self.operation_combo.clear()
+        self.operation_params.clear()
+        self.operation_status.clear()
+        if not kind or not url:
+            self.operation_target_label.setText("No REST operation target selected")
+            self.operation_output.setPlainText("Select a FeatureServer/MapServer layer or a GPServer task from the catalog.")
+            self.run_operation_btn.setEnabled(False)
+            self.operation_combo.blockSignals(False)
+            return
+
+        self.operation_target_label.setText(url)
+        operations = self.operation_definitions(kind, url, self.current_operation_metadata)
+        for operation in operations:
+            self.operation_combo.addItem(operation["label"], operation)
+        self.operation_combo.blockSignals(False)
+        self.operation_combo.setEnabled(bool(operations))
+        self.run_operation_btn.setEnabled(bool(operations))
+        self.on_operation_changed()
+
+    def operation_definitions(self, kind: str, url: str, metadata: dict[str, Any]) -> list[dict[str, Any]]:
+        if kind == "gp_task":
+            return self.gp_operation_definitions(metadata)
+        if kind == "layer":
+            return self.layer_operation_definitions(url, metadata)
+        return []
+
+    def layer_operation_definitions(self, url: str, metadata: dict[str, Any]) -> list[dict[str, Any]]:
+        return layer_operation_definitions(url, metadata)
+
+    def gp_operation_definitions(self, metadata: dict[str, Any]) -> list[dict[str, Any]]:
+        return gp_operation_definitions(metadata)
+
+    def default_gp_input_params(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        return default_gp_input_params(metadata)
+
+    def on_operation_changed(self):
+        if not hasattr(self, "operation_combo"):
+            return
+        operation = self.operation_combo.currentData()
+        if not isinstance(operation, dict):
+            return
+        self.operation_params.setPlainText(json.dumps(operation.get("params", {}), indent=2, ensure_ascii=False))
+        if operation.get("mode") == "gp_submit":
+            self.operation_status.setPlainText("submitJob will start an async GP job and poll /jobs/<jobId> until a final status.")
+        else:
+            self.operation_status.setPlainText(f"Ready to call /{operation.get('endpoint')}.")
+
+    def read_operation_params(self) -> dict[str, Any] | None:
+        text = self.operation_params.toPlainText().strip()
+        if not text:
+            params: dict[str, Any] = {}
+        else:
+            try:
+                params = json.loads(text)
+            except Exception as exc:
+                QMessageBox.warning(self, "Invalid operation parameters", f"Parameters must be a JSON object.\n{exc}")
+                return None
+            if not isinstance(params, dict):
+                QMessageBox.warning(self, "Invalid operation parameters", "Parameters must be a JSON object.")
+                return None
+        params.setdefault("f", "json")
+        return params
+
+    def normalize_operation_params(self, params: dict[str, Any]) -> dict[str, Any] | None:
+        if self.current_operation_kind != "gp_task":
+            return params
+        try:
+            normalized = normalize_gp_input_params(self.current_operation_metadata, params)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid GP parameters", str(exc))
+            return None
+        if normalized != params:
+            self.operation_params.setPlainText(json.dumps(normalized, indent=2, ensure_ascii=False))
+        return normalized
+
+    def run_selected_operation(self):
+        if not self.current_operation_url:
+            QMessageBox.warning(self, "No operation target", "Select a layer or GP task from the catalog first.")
+            return
+        operation = self.operation_combo.currentData()
+        if not isinstance(operation, dict):
+            QMessageBox.warning(self, "No operation selected", "Select an operation first.")
+            return
+        params = self.read_operation_params()
+        if params is None:
+            return
+        params = self.normalize_operation_params(params)
+        if params is None:
+            return
+
+        if operation.get("mode") == "gp_submit":
+            self.start_gp_job(self.current_operation_url, params)
+            return
+
+        endpoint = str(operation.get("endpoint", "")).strip("/")
+        operation_url = f"{self.current_operation_url.rstrip('/')}/{endpoint}" if endpoint else self.current_operation_url
+        self.operation_status.setPlainText(f"Calling {operation_url}")
+        self._get_json(operation_url, self.show_operation_result, params=params)
+
+    def show_operation_result(self, data: object):
+        text = json.dumps(data, indent=2, ensure_ascii=False)
+        self.operation_output.setPlainText(text)
+        self.response_text.setPlainText(text)
+        self.statusBar().showMessage("Operation completed")
+
+    def start_gp_job(self, task_url: str, params: dict[str, Any]):
+        self.set_busy(True)
+        request_params = self.add_token(params)
+        self.request_counter += 1
+        request_id = self.request_counter
+        self.active_request_id = request_id
+        self.gp_job_request_id = request_id
+        try:
+            self.last_request_url = str(httpx.URL(f"{task_url.rstrip('/')}/submitJob", params=request_params))
+        except Exception:
+            self.last_request_url = f"{task_url.rstrip('/')}/submitJob"
+        logger.info("GP submitJob %s: %s", request_id, self.redact_token_from_url(self.last_request_url))
+
+        self.gp_job_worker = GpJobWorker(task_url, request_params, read_timeout_seconds=self.http_read_timeout_seconds)
+        self.gp_job_worker.status.connect(lambda status, data, rid=request_id: self.on_gp_job_status(status, data, rid))
+        self.gp_job_worker.ok.connect(lambda data, elapsed_ms, rid=request_id: self.on_gp_job_ok(data, elapsed_ms, rid))
+        self.gp_job_worker.fail.connect(lambda message, rid=request_id: self.on_gp_job_fail(message, rid))
+        self.gp_job_worker.cancelled.connect(lambda rid=request_id: self.on_gp_job_cancelled(rid))
+        self.gp_job_worker.finished.connect(lambda rid=request_id: self.on_gp_job_finished(rid))
+        self.operation_status.setPlainText("Submitting GP job...")
+        self.gp_job_worker.start()
+        self.update_stop_query_button()
+
+    def on_gp_job_status(self, status: str, data: object, request_id: int):
+        if request_id != self.active_request_id:
+            return
+        self.operation_status.setPlainText(f"GP job status: {status}")
+        self.operation_output.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
+        self.statusBar().showMessage(f"GP job status: {status}")
+
+    def on_gp_job_ok(self, data: object, elapsed_ms: float, request_id: int):
+        if request_id != self.active_request_id:
+            return
+        self.active_request_id = 0
+        self.set_busy(False)
+        self.last_response = data
+        self.last_request_elapsed_ms = elapsed_ms
+        self.add_history_entry(elapsed_ms)
+        text = json.dumps(data, indent=2, ensure_ascii=False)
+        self.operation_output.setPlainText(text)
+        self.response_text.setPlainText(text)
+        status = data.get("jobStatus", "completed") if isinstance(data, dict) else "completed"
+        self.operation_status.setPlainText(f"GP job final status: {status}")
+        self.statusBar().showMessage(f"GP job completed in {elapsed_ms:.0f} ms: {status}")
+
+    def on_gp_job_fail(self, message: str, request_id: int):
+        if request_id != self.active_request_id:
+            return
+        self.active_request_id = 0
+        self.set_busy(False)
+        logger.error("GP job %s failed: %s", request_id, message)
+        self.operation_status.setPlainText(f"GP job error: {message}")
+        QMessageBox.critical(self, "GP job error", message)
+        self.statusBar().showMessage("GP job error")
+
+    def on_gp_job_cancelled(self, request_id: int):
+        if request_id != self.active_request_id:
+            return
+        self.active_request_id = 0
+        self.set_busy(False)
+        self.operation_status.setPlainText("GP job polling stopped")
+        self.statusBar().showMessage("GP job polling stopped")
+
+    def on_gp_job_finished(self, request_id: int):
+        if request_id == self.gp_job_request_id:
+            self.gp_job_worker = None
+            self.gp_job_request_id = 0
+        self.update_stop_query_button()
+
     # ---------------- Query / Results ----------------
 
     def run_query(self):
@@ -2283,6 +2201,12 @@ class ArcGISRestExplorer(QMainWindow):
             and self.fetch_all_request_id == stopped_request_id
         ):
             self.fetch_all_worker.requestInterruption()
+        if (
+            self.gp_job_worker is not None
+            and self.gp_job_worker.isRunning()
+            and self.gp_job_request_id == stopped_request_id
+        ):
+            self.gp_job_worker.requestInterruption()
         worker = self.workers.get(stopped_request_id)
         if worker is not None and worker.isRunning():
             worker.requestInterruption()
@@ -2649,24 +2573,46 @@ class ArcGISRestExplorer(QMainWindow):
             return
         self.collections_tree.clear()
         for idx, item_data in enumerate(self.collections):
-            title = item_data.get("name", "Unnamed query")
-            layer = item_data.get("layer_name") or item_data.get("layer_url", "")
-            item = QTreeWidgetItem([title, layer])
+            title = item_data.get("name", "Unnamed call")
+            target = self.collection_target_label(item_data)
+            item = QTreeWidgetItem([title, target])
             item.setData(0, Qt.UserRole, idx)
             self.collections_tree.addTopLevelItem(item)
         self.collections_tree.resizeColumnToContents(0)
 
+    def collection_target_label(self, item_data: dict[str, Any]) -> str:
+        call_type = item_data.get("call_type", "query")
+        if call_type == "operation":
+            operation = item_data.get("operation", {})
+            label = operation.get("label") if isinstance(operation, dict) else ""
+            target_name = item_data.get("target_name") or item_data.get("target_url", "")
+            return f"{label} - {target_name}" if label else target_name
+        return item_data.get("layer_name") or item_data.get("layer_url", "")
+
+    def save_current_call_to_collection(self):
+        if self.should_save_current_operation_call():
+            self.save_current_operation_to_collection()
+            return
+        self.save_current_query_to_collection()
+
+    def should_save_current_operation_call(self) -> bool:
+        if not hasattr(self, "request_tabs"):
+            return False
+        current_tab = self.request_tabs.tabText(self.request_tabs.currentIndex())
+        return current_tab == "Operations" and bool(self.current_operation_url)
+
     def save_current_query_to_collection(self):
         if not self.current_layer_url:
-            QMessageBox.warning(self, "No layer selected", "Select a layer before saving a query.")
+            QMessageBox.warning(self, "No call selected", "Select a layer or GP operation before saving a call.")
             return
 
         default_name = self.current_layer_metadata.get("name", "Layer query") if self.current_layer_metadata else "Layer query"
-        name, ok = QInputDialog.getText(self, "Save Query", "Query name:", text=default_name)
+        name, ok = QInputDialog.getText(self, "Save Call", "Call name:", text=default_name)
         if not ok or not name.strip():
             return
 
         query = {
+            "call_type": "query",
             "name": name.strip(),
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "base_url": self.base_url.text().strip(),
@@ -2683,7 +2629,49 @@ class ArcGISRestExplorer(QMainWindow):
         self.collections.append(query)
         self.save_collections()
         self.refresh_collections_tree()
-        self.statusBar().showMessage(f"Query saved: {query['name']}")
+        self.statusBar().showMessage(f"Call saved: {query['name']}")
+
+    def save_current_operation_to_collection(self):
+        if not self.current_operation_url:
+            QMessageBox.warning(self, "No operation selected", "Select a layer operation or GP task before saving a call.")
+            return
+        operation = self.operation_combo.currentData() if hasattr(self, "operation_combo") else None
+        if not isinstance(operation, dict):
+            QMessageBox.warning(self, "No operation selected", "Select an operation before saving a call.")
+            return
+        params = self.read_operation_params()
+        if params is None:
+            return
+        params = self.normalize_operation_params(params)
+        if params is None:
+            return
+
+        default_name = operation.get("label") or ("GP call" if self.current_operation_kind == "gp_task" else "REST operation")
+        name, ok = QInputDialog.getText(self, "Save Call", "Call name:", text=str(default_name))
+        if not ok or not name.strip():
+            return
+
+        call = {
+            "call_type": "operation",
+            "name": name.strip(),
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "base_url": self.base_url.text().strip(),
+            "target_url": self.current_operation_url,
+            "target_kind": self.current_operation_kind,
+            "target_name": self.current_operation_metadata.get("name") if isinstance(self.current_operation_metadata, dict) else "",
+            "target_metadata": self.current_operation_metadata or {},
+            "operation": {
+                "label": operation.get("label"),
+                "endpoint": operation.get("endpoint"),
+                "mode": operation.get("mode"),
+            },
+            "params": params,
+        }
+
+        self.collections.append(call)
+        self.save_collections()
+        self.refresh_collections_tree()
+        self.statusBar().showMessage(f"Call saved: {call['name']}")
 
     def selected_collection_index(self) -> int | None:
         items = self.collections_tree.selectedItems() if hasattr(self, "collections_tree") else []
@@ -2692,13 +2680,22 @@ class ArcGISRestExplorer(QMainWindow):
         idx = items[0].data(0, Qt.UserRole)
         return idx if isinstance(idx, int) else None
 
-    def load_selected_collection_query(self):
+    def load_selected_collection_call(self):
         idx = self.selected_collection_index()
         if idx is None or idx >= len(self.collections):
-            QMessageBox.information(self, "No query selected", "Select a saved query first.")
+            QMessageBox.information(self, "No call selected", "Select a saved call first.")
             return
 
-        query = self.collections[idx]
+        call = self.collections[idx]
+        if call.get("call_type", "query") == "operation":
+            self.load_operation_call(call)
+            return
+        self.load_query_call(call)
+
+    def load_selected_collection_query(self):
+        self.load_selected_collection_call()
+
+    def load_query_call(self, query: dict[str, Any]):
         self.base_url.setText(query.get("base_url", self.base_url.text()))
         self.current_layer_url = query.get("layer_url")
         self.where_input.setText(query.get("where", "1=1"))
@@ -2713,17 +2710,57 @@ class ArcGISRestExplorer(QMainWindow):
 
         if self.current_layer_url:
             self._get_json(self.current_layer_url, self.show_layer_metadata)
-        self.statusBar().showMessage(f"Query loaded: {query.get('name', '')}")
+        if hasattr(self, "request_tabs"):
+            self.request_tabs.setCurrentIndex(0)
+        self.statusBar().showMessage(f"Call loaded: {query.get('name', '')}")
+
+    def load_operation_call(self, call: dict[str, Any]):
+        self.base_url.setText(call.get("base_url", self.base_url.text()))
+        target_url = call.get("target_url")
+        target_kind = call.get("target_kind")
+        metadata = call.get("target_metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        self.update_operation_panel(target_kind, target_url, metadata)
+
+        saved_operation = call.get("operation", {})
+        if isinstance(saved_operation, dict):
+            self.select_saved_operation(saved_operation)
+        params = call.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+        self.operation_params.setPlainText(json.dumps(params, indent=2, ensure_ascii=False))
+        if hasattr(self, "request_tabs"):
+            ix = self.request_tabs.indexOf(self.operation_params.parentWidget())
+            self.request_tabs.setCurrentIndex(1 if ix < 0 else ix)
+        self.statusBar().showMessage(f"Call loaded: {call.get('name', '')}")
+
+    def select_saved_operation(self, saved_operation: dict[str, Any]):
+        for index in range(self.operation_combo.count()):
+            operation = self.operation_combo.itemData(index)
+            if not isinstance(operation, dict):
+                continue
+            if (
+                operation.get("endpoint") == saved_operation.get("endpoint")
+                and operation.get("mode") == saved_operation.get("mode")
+            ):
+                self.operation_combo.setCurrentIndex(index)
+                return
+        label = saved_operation.get("label")
+        if label:
+            index = self.operation_combo.findText(str(label))
+            if index >= 0:
+                self.operation_combo.setCurrentIndex(index)
 
     def delete_selected_collection_query(self):
         idx = self.selected_collection_index()
         if idx is None or idx >= len(self.collections):
-            QMessageBox.information(self, "No query selected", "Select a saved query first.")
+            QMessageBox.information(self, "No call selected", "Select a saved call first.")
             return
         removed = self.collections.pop(idx)
         self.save_collections()
         self.refresh_collections_tree()
-        self.statusBar().showMessage(f"Query deleted: {removed.get('name', '')}")
+        self.statusBar().showMessage(f"Call deleted: {removed.get('name', '')}")
 
     def load_history(self):
         self.history = []
