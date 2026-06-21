@@ -184,3 +184,7 @@ https://sampleserver6.arcgisonline.com/arcgis/rest/services
 - Leaflet assets are currently loaded from CDN in the embedded map view.
 - XLSX export uses a lightweight built-in writer and does not require `openpyxl`.
 - JSON writes are atomic and corrupt local JSON files are backed up before being replaced.
+
+## Disclaimer
+
+The software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
