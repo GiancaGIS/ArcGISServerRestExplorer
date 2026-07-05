@@ -1,6 +1,6 @@
 from arcgis_server_rest_explorer.app import ArcGISRestExplorer
 from arcgis_server_rest_explorer.operations import normalize_gp_input_params
-from arcgis_server_rest_explorer.workers import GpJobWorker
+from arcgis_server_rest_explorer.workers import FetchAllWorker, GpJobWorker, HttpWorker
 
 
 def app_shell():
@@ -57,6 +57,12 @@ def test_layer_operations_include_attachment_and_relationship_helpers():
 def test_gp_job_worker_keeps_token_for_status_polling():
     assert GpJobWorker.token_params({"token": "abc", "f": "json"}) == {"token": "abc"}
     assert GpJobWorker.token_params({"f": "json"}) == {}
+
+
+def test_workers_keep_ssl_verify_setting():
+    assert HttpWorker("https://example.com", verify_ssl=False).verify_ssl is False
+    assert FetchAllWorker("https://example.com/query", {}, 100, verify_ssl=False).verify_ssl is False
+    assert GpJobWorker("https://example.com/task", {}, verify_ssl=False).verify_ssl is False
 
 
 def test_gp_string_input_serializes_structured_value_as_valid_string():

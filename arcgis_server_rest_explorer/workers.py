@@ -29,11 +29,18 @@ class HttpWorker(QThread):
     ok = Signal(object, float)
     fail = Signal(str)
 
-    def __init__(self, url: str, params: dict[str, Any] | None = None, read_timeout_seconds: int = DEFAULT_HTTP_READ_TIMEOUT_SECONDS):
+    def __init__(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        read_timeout_seconds: int = DEFAULT_HTTP_READ_TIMEOUT_SECONDS,
+        verify_ssl: bool = True,
+    ):
         super().__init__()
         self.url = url
         self.params = params or {}
         self.read_timeout_seconds = read_timeout_seconds
+        self.verify_ssl = verify_ssl
 
     def run(self):
         started = time.perf_counter()
@@ -41,7 +48,11 @@ class HttpWorker(QThread):
             params = dict(self.params)
             params.setdefault("f", "json")
 
-            with httpx.Client(timeout=build_http_timeout(self.read_timeout_seconds), follow_redirects=True) as client:
+            with httpx.Client(
+                timeout=build_http_timeout(self.read_timeout_seconds),
+                follow_redirects=True,
+                verify=self.verify_ssl,
+            ) as client:
                 if self.isInterruptionRequested():
                     return
                 response = client.post(self.url, params=params)
@@ -80,18 +91,31 @@ class FetchAllWorker(QThread):
     cancelled = Signal()
     progress = Signal(int, int)
 
-    def __init__(self, url: str, params: dict[str, Any], page_size: int, max_workers: int = 4, read_timeout_seconds: int = DEFAULT_HTTP_READ_TIMEOUT_SECONDS):
+    def __init__(
+        self,
+        url: str,
+        params: dict[str, Any],
+        page_size: int,
+        max_workers: int = 4,
+        read_timeout_seconds: int = DEFAULT_HTTP_READ_TIMEOUT_SECONDS,
+        verify_ssl: bool = True,
+    ):
         super().__init__()
         self.url = url
         self.params = dict(params)
         self.page_size = max(1, int(page_size))
         self.max_workers = max(1, int(max_workers))
         self.read_timeout_seconds = read_timeout_seconds
+        self.verify_ssl = verify_ssl
 
     def run(self):
         started = time.perf_counter()
         try:
-            with httpx.Client(timeout=build_http_timeout(self.read_timeout_seconds), follow_redirects=True) as client:
+            with httpx.Client(
+                timeout=build_http_timeout(self.read_timeout_seconds),
+                follow_redirects=True,
+                verify=self.verify_ssl,
+            ) as client:
                 self.raise_if_cancelled()
                 total = self.fetch_count(client)
                 self.raise_if_cancelled()
@@ -185,7 +209,11 @@ class FetchAllWorker(QThread):
         params["resultOffset"] = str(offset)
         params["resultRecordCount"] = str(self.page_size)
 
-        with httpx.Client(timeout=build_http_timeout(self.read_timeout_seconds), follow_redirects=True) as client:
+        with httpx.Client(
+            timeout=build_http_timeout(self.read_timeout_seconds),
+            follow_redirects=True,
+            verify=self.verify_ssl,
+        ) as client:
             response = client.post(self.url, params=params)
             response.raise_for_status()
             data = response.json()
@@ -217,19 +245,25 @@ class GpJobWorker(QThread):
         params: dict[str, Any],
         poll_interval_seconds: float = 2.0,
         read_timeout_seconds: int = DEFAULT_HTTP_READ_TIMEOUT_SECONDS,
+        verify_ssl: bool = True,
     ):
         super().__init__()
         self.task_url = task_url.rstrip("/")
         self.params = dict(params)
         self.poll_interval_seconds = max(0.5, float(poll_interval_seconds))
         self.read_timeout_seconds = read_timeout_seconds
+        self.verify_ssl = verify_ssl
 
     def run(self):
         started = time.perf_counter()
         try:
             params = dict(self.params)
             params.setdefault("f", "json")
-            with httpx.Client(timeout=build_http_timeout(self.read_timeout_seconds), follow_redirects=True) as client:
+            with httpx.Client(
+                timeout=build_http_timeout(self.read_timeout_seconds),
+                follow_redirects=True,
+                verify=self.verify_ssl,
+            ) as client:
                 self.raise_if_cancelled()
                 submit_response = client.post(f"{self.task_url}/submitJob", data=params)
                 submit_response.raise_for_status()
