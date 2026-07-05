@@ -181,6 +181,7 @@ class ArcGISRestExplorer(QMainWindow):
         self.current_theme = "Dark"
         self.map_style_preset = "ArcGIS renderer"
         self.http_read_timeout_seconds = DEFAULT_HTTP_READ_TIMEOUT_SECONDS
+        self.verify_ssl = True
         self.google_maps_api_key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
         self.current_auth_config: dict[str, Any] = self.default_auth_config()
 
@@ -959,6 +960,9 @@ class ArcGISRestExplorer(QMainWindow):
         http_timeout_spin.setSuffix(" sec")
         http_timeout_spin.setValue(int(self.http_read_timeout_seconds))
 
+        verify_ssl_check = QCheckBox("Verify SSL certificates")
+        verify_ssl_check.setChecked(bool(self.verify_ssl))
+
         google_api_key_input = QLineEdit()
         google_api_key_input.setEchoMode(QLineEdit.Password)
         google_api_key_input.setText(self.google_maps_api_key)
@@ -967,11 +971,13 @@ class ArcGISRestExplorer(QMainWindow):
         form.addRow("Theme", theme_combo)
         form.addRow("Map object style", map_style_combo)
         form.addRow("HTTP read timeout", http_timeout_spin)
+        form.addRow("REST SSL", verify_ssl_check)
         form.addRow("Google Maps API key", google_api_key_input)
         layout.addLayout(form)
 
         hint = QLabel(
             "Theme affects the full interface. Map object style applies to mapped query features. "
+            "Disable SSL verification only for trusted ArcGIS/Portal endpoints with self-signed certificates. "
             "Google basemaps use the official Map Tiles API and require a Google Maps Platform API key."
         )
         hint.setWordWrap(True)
@@ -989,10 +995,15 @@ class ArcGISRestExplorer(QMainWindow):
             self.map_style_preset = map_style_combo.currentText()
             self.sync_map_style_combo()
             self.http_read_timeout_seconds = http_timeout_spin.value()
+            self.verify_ssl = verify_ssl_check.isChecked()
             self.google_maps_api_key = google_api_key_input.text().strip()
             self.draw_features_on_map(self.last_geojson_features)
             self.save_settings()
-            self.statusBar().showMessage(f"Settings applied: {self.current_theme}, {self.map_style_preset}, timeout {self.http_read_timeout_seconds}s")
+            ssl_status = "SSL verify on" if self.verify_ssl else "SSL verify off"
+            self.statusBar().showMessage(
+                f"Settings applied: {self.current_theme}, {self.map_style_preset}, "
+                f"timeout {self.http_read_timeout_seconds}s, {ssl_status}"
+            )
 
     # ---------------- Settings / Notifications ----------------
 
@@ -1021,6 +1032,7 @@ class ArcGISRestExplorer(QMainWindow):
             self.map_style_preset = str(map_style_preset)
             self.sync_map_style_combo()
         self.http_read_timeout_seconds = self.parse_timeout_setting(settings.get("http_read_timeout_seconds"))
+        self.verify_ssl = bool(settings.get("verify_ssl", True))
         self.google_maps_api_key = str(settings.get("google_maps_api_key") or os.environ.get("GOOGLE_MAPS_API_KEY", "")).strip()
 
         self.return_geometry.setChecked(bool(settings.get("return_geometry", True)))
@@ -1056,6 +1068,7 @@ class ArcGISRestExplorer(QMainWindow):
             "basemap": self.basemap_combo.currentText(),
             "map_style_preset": self.map_style_preset,
             "http_read_timeout_seconds": self.http_read_timeout_seconds,
+            "verify_ssl": self.verify_ssl,
             "google_maps_api_key": self.google_maps_api_key,
             "return_geometry": self.return_geometry.isChecked(),
             "fetch_all_pages": self.fetch_all_pages.isChecked(),
@@ -1370,7 +1383,7 @@ class ArcGISRestExplorer(QMainWindow):
         except Exception:
             self.last_request_url = url
         logger.info("Request %s: %s", request_id, self.redact_token_from_url(self.last_request_url))
-        self.worker = HttpWorker(url, request_params, self.http_read_timeout_seconds)
+        self.worker = HttpWorker(url, request_params, self.http_read_timeout_seconds, verify_ssl=self.verify_ssl)
         self.workers[request_id] = self.worker
         self.worker.ok.connect(lambda data, elapsed_ms, rid=request_id: self._on_ok(data, elapsed_ms, callback, rid))
         self.worker.fail.connect(lambda message, rid=request_id: self._on_fail(message, rid))
@@ -2066,7 +2079,12 @@ class ArcGISRestExplorer(QMainWindow):
             self.last_request_url = f"{task_url.rstrip('/')}/submitJob"
         logger.info("GP submitJob %s: %s", request_id, self.redact_token_from_url(self.last_request_url))
 
-        self.gp_job_worker = GpJobWorker(task_url, request_params, read_timeout_seconds=self.http_read_timeout_seconds)
+        self.gp_job_worker = GpJobWorker(
+            task_url,
+            request_params,
+            read_timeout_seconds=self.http_read_timeout_seconds,
+            verify_ssl=self.verify_ssl,
+        )
         self.gp_job_worker.status.connect(lambda status, data, rid=request_id: self.on_gp_job_status(status, data, rid))
         self.gp_job_worker.ok.connect(lambda data, elapsed_ms, rid=request_id: self.on_gp_job_ok(data, elapsed_ms, rid))
         self.gp_job_worker.fail.connect(lambda message, rid=request_id: self.on_gp_job_fail(message, rid))
@@ -2171,6 +2189,7 @@ class ArcGISRestExplorer(QMainWindow):
             int(self.max_records.currentText()),
             max_workers=4,
             read_timeout_seconds=self.http_read_timeout_seconds,
+            verify_ssl=self.verify_ssl,
         )
         self.fetch_all_worker.progress.connect(
             lambda completed, total, rid=request_id: self.on_parallel_fetch_progress(completed, total, rid)
@@ -2909,7 +2928,7 @@ class ArcGISRestExplorer(QMainWindow):
                         "remember_credentials": True,
                     }
                 )
-        dialog = GenerateTokenDialog(self.normalize_services_url(), dialog_config, self)
+        dialog = GenerateTokenDialog(self.normalize_services_url(), dialog_config, self, verify_ssl=self.verify_ssl)
         if dialog.exec() == QDialog.Accepted and dialog.generated_token:
             generated_auth_config = dialog.get_auth_config()
             credentials_storage = self.persist_generated_credentials_for_current_connection(generated_auth_config)

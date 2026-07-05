@@ -68,6 +68,17 @@ def test_generate_token_dialog_standalone_payload_omits_client_fields():
     assert "ip" not in payload
 
 
+def test_generate_token_dialog_keeps_ssl_verify_setting():
+    qt_app()
+    dialog = GenerateTokenDialog(
+        "https://server.example.com/arcgis/rest/services",
+        {"mode": "server"},
+        verify_ssl=False,
+    )
+
+    assert dialog.verify_ssl is False
+
+
 def test_generate_token_dialog_standalone_advanced_payload_adds_documented_client_fields():
     qt_app()
     dialog = GenerateTokenDialog(

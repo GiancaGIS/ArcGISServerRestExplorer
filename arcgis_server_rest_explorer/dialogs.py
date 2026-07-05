@@ -31,13 +31,20 @@ def set_form_row_visible(form: QFormLayout, widget, visible: bool) -> None:
 
 
 class GenerateTokenDialog(QDialog):
-    def __init__(self, default_services_url: str, auth_config: dict[str, Any] | None = None, parent=None):
+    def __init__(
+        self,
+        default_services_url: str,
+        auth_config: dict[str, Any] | None = None,
+        parent=None,
+        verify_ssl: bool = True,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Generate ArcGIS Token")
         self.resize(800, 600)
         self.services_url = default_services_url
         self.generated_token = ""
         self.expires_text = ""
+        self.verify_ssl = verify_ssl
         self.auth_config = auth_config or {}
         self.mode = self.auth_config.get("mode", "server")
         if self.mode not in ("server", "portal"):
@@ -154,7 +161,7 @@ class GenerateTokenDialog(QDialog):
         token_endpoint = self.token_url.text().strip()
 
         try:
-            with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            with httpx.Client(timeout=30.0, follow_redirects=True, verify=self.verify_ssl) as client:
                 response = client.post(token_endpoint, data=payload)
                 response.raise_for_status()
                 data = response.json()
